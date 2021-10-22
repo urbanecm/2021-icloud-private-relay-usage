@@ -2,6 +2,8 @@
 
 import ipaddress
 
+from collections import defaultdict
+
 import pandas as pd
 import numpy as np
 
@@ -12,23 +14,41 @@ from pyspark.sql import functions as F, types as T, Window
 # data comes from https://mask-api.icloud.com/egress-ip-ranges.csv
 relay_ranges = pd.read_csv('/home/urbanecm/Documents/steward/icloud-private-relay-usage/egress-ip-ranges.csv', sep=',', names=['range', 'country', 'region', 'city', 'empty']).drop(columns=['empty'])
 
-relay_nets = []
+## This data structure is based on using https://stackoverflow.com/a/1004527
+## to determine if an IP falls within a given network, which allows us to make
+## the following assertions:
+## 1: IPv4 and IPV6 networks are disjoint so we can split on IP version. There used to be
+##    compatibility between the networks, but that was deprecated according to
+##    https://networkengineering.stackexchange.com/questions/57903/are-the-ipv6-address-space-and-ipv4-address-space-completely-disjoint
+## 2: The netmask is binary-AND'ed onto the binary IP address, hence
+##    the second layer are the netmasks, of which we expect there to be a limited number.
+## 3: We then have a limited set of possible networks which are all numbers
+##    so we store those as a set and let Python handle it, which gives us fast lookup.
+relay_nets = {
+	'4' : defaultdict(set),
+	'6' : defaultdict(set)
+}
+
 for net_raw in relay_ranges.range:
 	net = ipaddress.ip_network(net_raw)
-	relay_nets.append((
-		# network address in binary
-		int(net.network_address),
-		# netmask in binary
-		int(net.netmask)
-	))
+
+	net_v = str(net.version)
+
+	relay_nets[net_v][net.netmask].add(int(net.network_address))
 
 def is_ip_private_relay(ip_raw):
-	# TODO: edit this to u = se https://stackoverflow.com/a/1004527 instead
-	ip = int(ipaddress.ip_address(ip_raw))
-	for net in relay_nets:
-		if (ip & net[1]) == net[0]:
-			return True
-	return False
+	try:
+		ip = ipaddress.ip_address(ip_raw)
+		bin_ip = int(ip)
+
+		for netmask, range_set in relay_nets[str(ip.version)].items():
+			bin_netmask = int(netmask)
+			if (bin_ip & bin_netmask) in range_set:
+				return(True)
+	except ValueError: # not a valid IP address
+		pass
+
+	return(False)
 
 # start spark session
 spark = (
